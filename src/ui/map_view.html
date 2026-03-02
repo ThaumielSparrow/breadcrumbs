@@ -4,29 +4,193 @@
   <meta charset="utf-8">
   <title>Track Map</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-  <style>html,body,#map{height:100%;margin:0;padding:0}</style>
+
+  <!-- Use jsDelivr CDN (reliable, and leaflet-hotline is definitely present there) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css"/>
+
+  <style>
+    html, body, #map { height: 100%; margin: 0; padding: 0; }
+
+    /* Legend overlay */
+    #legend {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      z-index: 1000;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(0,0,0,0.15);
+      border-radius: 10px;
+      padding: 10px 12px;
+      width: 240px;
+      font-family: sans-serif;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.12);
+      display: none;
+    }
+    #legend-title {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    #legend-bar {
+      height: 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(0,0,0,0.15);
+      margin-bottom: 6px;
+    }
+    #legend-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      opacity: 0.9;
+    }
+
+    /* Helpful error message if Leaflet fails to load */
+    #msg {
+      position: absolute;
+      left: 10px;
+      top: 10px;
+      z-index: 2000;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(0,0,0,0.15);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-family: sans-serif;
+      display: none;
+      max-width: 520px;
+    }
+  </style>
 </head>
+
 <body>
 <div id="map"></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<div id="msg"></div>
+
+<div id="legend">
+  <div id="legend-title"></div>
+  <div id="legend-bar"></div>
+  <div id="legend-labels">
+    <span id="legend-min"></span>
+    <span id="legend-max"></span>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/leaflet-hotline@0.4.0/dist/leaflet.hotline.min.js"></script>
+
 <script>
-  const map = L.map('map').setView([0,0], 2);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
-  let polyline = null;
-  function plotTrack(track) {
-    // track: array of [lat,lon]
-    if (polyline) polyline.remove();
-    polyline = L.polyline(track, {weight:4}).addTo(map);
-    map.fitBounds(polyline.getBounds());
-    // start / end markers
-    if (track.length) {
-      L.marker(track[0]).addTo(map).bindPopup('Start').openPopup();
-      L.marker(track[track.length-1]).addTo(map).bindPopup('Last');
-    }
+  var map = null;
+  var hotlineLayer = null;
+  var startMarker = null;
+  var endMarker = null;
+
+  // Viridis-ish palette (good for most telemetry scalars)
+  var palette = {
+    0.0: "#440154",
+    0.25: "#3b528b",
+    0.5: "#21918c",
+    0.75: "#5ec962",
+    1.0: "#fde725"
+  };
+
+  function showMsg(text) {
+    var el = document.getElementById("msg");
+    el.textContent = text;
+    el.style.display = "block";
   }
-  // expose to Qt
-  window.plotTrack = plotTrack;
+
+  function ensureMap() {
+    if (map) return true;
+
+    if (typeof L === "undefined") {
+      showMsg("Map error: Leaflet failed to load (L is undefined). If you are using Qt WebEngine, ensure LocalContentCanAccessRemoteUrls is enabled.");
+      return false;
+    }
+
+    map = L.map("map").setView([0, 0], 2);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
+    return true;
+  }
+
+  function gradientCSSFromPalette(p) {
+    var stops = Object.keys(p).map(parseFloat).sort(function(a,b){ return a-b; });
+    var parts = stops.map(function(s){
+      var pct = Math.round(s * 100);
+      return p[s] + " " + pct + "%";
+    });
+    return "linear-gradient(to right, " + parts.join(", ") + ")";
+  }
+
+  function setLegend(meta) {
+    var legend = document.getElementById("legend");
+    var title = document.getElementById("legend-title");
+    var bar = document.getElementById("legend-bar");
+    var lmin = document.getElementById("legend-min");
+    var lmax = document.getElementById("legend-max");
+
+    if (!meta) {
+      legend.style.display = "none";
+      return;
+    }
+
+    title.textContent = meta.title || "";
+    bar.style.background = gradientCSSFromPalette(palette);
+    lmin.textContent = meta.label_min || "";
+    lmax.textContent = meta.label_max || "";
+    legend.style.display = "block";
+  }
+
+  window.clearTrack = function() {
+    if (hotlineLayer) { hotlineLayer.remove(); hotlineLayer = null; }
+    if (startMarker) { startMarker.remove(); startMarker = null; }
+    if (endMarker) { endMarker.remove(); endMarker = null; }
+    setLegend(null);
+  };
+
+  window.plotHotline = function(data, meta) {
+    if (!ensureMap()) return;
+
+    window.clearTrack();
+
+    if (!data || data.length < 2) {
+      map.setView([0, 0], 2);
+      return;
+    }
+
+    // If plugin isn't available for some reason, fall back to a normal polyline
+    if (!L.hotline) {
+      var coords2d = data.map(function(p){ return [p[0], p[1]]; });
+      var plain = L.polyline(coords2d, { weight: 4 }).addTo(map);
+      map.fitBounds(plain.getBounds(), { padding: [20, 20] });
+      startMarker = L.marker(coords2d[0]).addTo(map).bindPopup("Start");
+      endMarker = L.marker(coords2d[coords2d.length - 1]).addTo(map).bindPopup("Last");
+      setLegend(meta);
+      return;
+    }
+
+    hotlineLayer = L.hotline(data, {
+      min: meta && typeof meta.min === "number" ? meta.min : 0,
+      max: meta && typeof meta.max === "number" ? meta.max : 1,
+      palette: palette,
+      weight: 6,
+      outlineWidth: 1,
+      outlineColor: "#000"
+    }).addTo(map);
+
+    map.fitBounds(hotlineLayer.getBounds(), { padding: [20, 20] });
+
+    var start = [data[0][0], data[0][1]];
+    var end = [data[data.length - 1][0], data[data.length - 1][1]];
+    startMarker = L.marker(start).addTo(map).bindPopup("Start");
+    endMarker = L.marker(end).addTo(map).bindPopup("Last");
+
+    setLegend(meta);
+  };
+
+  // Backwards compatibility: if anything still calls plotTrack(...)
+  window.plotTrack = window.plotHotline;
+
+  ensureMap();
 </script>
 </body>
 </html>

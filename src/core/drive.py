@@ -1,4 +1,4 @@
-# src/core/drive_detect.py
+# src/core/drive.py
 import psutil
 import os
 import time
