@@ -5,7 +5,7 @@
   <title>Track Map</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
-  <!-- Use jsDelivr CDN (reliable, and leaflet-hotline is definitely present there) -->
+  <!-- Leaflet + hotline via jsDelivr -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css"/>
 
   <style>
@@ -56,7 +56,7 @@
       padding: 8px 10px;
       font-family: sans-serif;
       display: none;
-      max-width: 520px;
+      max-width: 560px;
     }
   </style>
 </head>
@@ -80,11 +80,23 @@
 
 <script>
   var map = null;
-  var hotlineLayer = null;
+
+  // Full route (static) and trail route (growing during playback)
+  var fullLayer = null;
+  var trailLayer = null;
+
+  // Markers
   var startMarker = null;
   var endMarker = null;
+  var droneMarker = null;
 
-  // Viridis-ish palette (good for most telemetry scalars)
+  // Track state
+  var fullData = null;       // [[lat, lon, z], ...]
+  var fullMeta = null;
+  var lastTrailIndex = -1;   // last integer point included in trail
+  var followMode = false;
+
+  // Viridis-ish palette (nice for telemetry)
   var palette = {
     0.0: "#440154",
     0.25: "#3b528b",
@@ -140,13 +152,52 @@
     legend.style.display = "block";
   }
 
+  // Simple quadcopter-ish SVG icon (inline data URL)
+  var quadSvg =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">' +
+    '<circle cx="16" cy="16" r="10" fill="#111"/>' +
+    '<circle cx="48" cy="16" r="10" fill="#111"/>' +
+    '<circle cx="16" cy="48" r="10" fill="#111"/>' +
+    '<circle cx="48" cy="48" r="10" fill="#111"/>' +
+    '<rect x="28" y="28" width="8" height="8" rx="2" fill="#ffcc00"/>' +
+    '<path d="M16 16 L32 32 L48 16" stroke="#ffcc00" stroke-width="4" fill="none" stroke-linecap="round"/>' +
+    '<path d="M16 48 L32 32 L48 48" stroke="#ffcc00" stroke-width="4" fill="none" stroke-linecap="round"/>' +
+    '</svg>';
+
+  var quadIcon = null;
+  function ensureQuadIcon() {
+    if (quadIcon) return;
+    quadIcon = L.icon({
+      iconUrl: "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(quadSvg),
+      iconSize: [28, 28],
+      iconAnchor: [14, 14]
+    });
+  }
+
+  function removeLayerSafe(layer) {
+    try { if (layer) layer.remove(); } catch (e) {}
+  }
+
+  window.setFollowMode = function(enabled) {
+    followMode = !!enabled;
+  };
+
   window.clearTrack = function() {
-    if (hotlineLayer) { hotlineLayer.remove(); hotlineLayer = null; }
-    if (startMarker) { startMarker.remove(); startMarker = null; }
-    if (endMarker) { endMarker.remove(); endMarker = null; }
+    removeLayerSafe(fullLayer); fullLayer = null;
+    removeLayerSafe(trailLayer); trailLayer = null;
+
+    removeLayerSafe(startMarker); startMarker = null;
+    removeLayerSafe(endMarker); endMarker = null;
+    removeLayerSafe(droneMarker); droneMarker = null;
+
+    fullData = null;
+    fullMeta = null;
+    lastTrailIndex = -1;
+
     setLegend(null);
   };
 
+  // Main plot call from Python (still works for non-playback viewing)
   window.plotHotline = function(data, meta) {
     if (!ensureMap()) return;
 
@@ -157,27 +208,31 @@
       return;
     }
 
-    // If plugin isn't available for some reason, fall back to a normal polyline
+    fullData = data;
+    fullMeta = meta || null;
+
+    // If plugin isn't available, fallback to normal polyline (no gradient)
     if (!L.hotline) {
       var coords2d = data.map(function(p){ return [p[0], p[1]]; });
-      var plain = L.polyline(coords2d, { weight: 4 }).addTo(map);
-      map.fitBounds(plain.getBounds(), { padding: [20, 20] });
+      fullLayer = L.polyline(coords2d, { weight: 5 }).addTo(map);
+      map.fitBounds(fullLayer.getBounds(), { padding: [20, 20] });
       startMarker = L.marker(coords2d[0]).addTo(map).bindPopup("Start");
       endMarker = L.marker(coords2d[coords2d.length - 1]).addTo(map).bindPopup("Last");
       setLegend(meta);
       return;
     }
 
-    hotlineLayer = L.hotline(data, {
+    fullLayer = L.hotline(data, {
       min: meta && typeof meta.min === "number" ? meta.min : 0,
       max: meta && typeof meta.max === "number" ? meta.max : 1,
       palette: palette,
       weight: 6,
       outlineWidth: 1,
-      outlineColor: "#000"
+      outlineColor: "#000",
+      opacity: 1.0
     }).addTo(map);
 
-    map.fitBounds(hotlineLayer.getBounds(), { padding: [20, 20] });
+    map.fitBounds(fullLayer.getBounds(), { padding: [20, 20] });
 
     var start = [data[0][0], data[0][1]];
     var end = [data[data.length - 1][0], data[data.length - 1][1]];
@@ -185,10 +240,110 @@
     endMarker = L.marker(end).addTo(map).bindPopup("Last");
 
     setLegend(meta);
+
+    // Put drone at start and clear trail initially
+    window.setPlaybackProgress(0.0);
   };
 
-  // Backwards compatibility: if anything still calls plotTrack(...)
+  // Backwards compatibility
   window.plotTrack = window.plotHotline;
+
+  // Playback: progress is float [0 .. N-1]
+  window.setPlaybackProgress = function(progress) {
+    if (!ensureMap()) return;
+    if (!fullData || fullData.length < 2) return;
+
+    var n = fullData.length;
+    var p = Math.max(0, Math.min(progress, n - 1));
+    var i = Math.floor(p);
+    var frac = p - i;
+
+    // Interpolate marker position between point i and i+1
+    var a = fullData[i];
+    var b = (i + 1 < n) ? fullData[i + 1] : fullData[i];
+    var lat = a[0] + (b[0] - a[0]) * frac;
+    var lon = a[1] + (b[1] - a[1]) * frac;
+
+    ensureQuadIcon();
+    if (!droneMarker) {
+      droneMarker = L.marker([lat, lon], { icon: quadIcon, interactive: false }).addTo(map);
+    } else {
+      droneMarker.setLatLng([lat, lon]);
+    }
+
+    if (followMode) {
+      // Pan gently; avoid heavy animation
+      map.panTo([lat, lon], { animate: false });
+    }
+
+    // Trail uses the same gradient metric as the full path.
+    // We update trail only when integer index increases (or scrubbing goes backward).
+    var targetIndex = Math.max(0, Math.min(i, n - 1));
+
+    // If at very beginning, clear trail
+    if (targetIndex < 1) {
+      removeLayerSafe(trailLayer); trailLayer = null;
+      lastTrailIndex = targetIndex;
+      return;
+    }
+
+    // If trail doesn't exist yet, create it with first 2 points
+    if (!trailLayer && L.hotline) {
+      var initData = fullData.slice(0, 2);
+      trailLayer = L.hotline(initData, {
+        min: fullMeta && typeof fullMeta.min === "number" ? fullMeta.min : 0,
+        max: fullMeta && typeof fullMeta.max === "number" ? fullMeta.max : 1,
+        palette: palette,
+        weight: 9,
+        outlineWidth: 1,
+        outlineColor: "#000",
+        opacity: 1.0
+      }).addTo(map);
+      lastTrailIndex = 1;
+    }
+
+    // If plugin missing, we can't do gradient trail; just skip trail
+    if (!L.hotline) {
+      lastTrailIndex = targetIndex;
+      return;
+    }
+
+    // Determine whether to rebuild (scrub backwards / big jump) or append incrementally
+    var bigJump = (lastTrailIndex >= 0) ? (Math.abs(targetIndex - lastTrailIndex) > 500) : true;
+    if (targetIndex < lastTrailIndex || bigJump) {
+      // Rebuild trail up to targetIndex
+      removeLayerSafe(trailLayer); trailLayer = null;
+      var sub = fullData.slice(0, targetIndex + 1);
+      trailLayer = L.hotline(sub, {
+        min: fullMeta && typeof fullMeta.min === "number" ? fullMeta.min : 0,
+        max: fullMeta && typeof fullMeta.max === "number" ? fullMeta.max : 1,
+        palette: palette,
+        weight: 9,
+        outlineWidth: 1,
+        outlineColor: "#000",
+        opacity: 1.0
+      }).addTo(map);
+      lastTrailIndex = targetIndex;
+      return;
+    }
+
+    // Append forward incrementally (fast path)
+    if (targetIndex > lastTrailIndex && trailLayer) {
+      for (var j = lastTrailIndex + 1; j <= targetIndex; j++) {
+        // L.Hotline extends L.Polyline, so addLatLng exists
+        try {
+          trailLayer.addLatLng(fullData[j]);
+        } catch (e) {
+          // Fallback: setLatLngs if addLatLng fails
+          try {
+            var sub2 = fullData.slice(0, j + 1);
+            trailLayer.setLatLngs(sub2);
+          } catch (e2) {}
+        }
+      }
+      lastTrailIndex = targetIndex;
+    }
+  };
 
   ensureMap();
 </script>
