@@ -1,9 +1,7 @@
 import sys
 import os
 import json
-import bisect
 import statistics
-from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, QRunnable, QThreadPool, QUrl, Qt, QTimer
 from PySide6.QtWidgets import (
@@ -76,15 +74,16 @@ class MainWindow(QMainWindow):
         self.sessions_by_day: dict[str, list[SessionMeta]] = {}
         self.current_track: list[TrackPoint] | None = None
 
-        # Playback timeline (seconds from start)
+        # Timeline (seconds from start) sent to JS for smooth playback
         self.timeline_s: list[float] = []
         self.total_duration_s: float = 0.0
 
-        # Playback state
+        # Playback/UI state
         self.playing: bool = False
         self.user_scrubbing: bool = False
-        self.playback_elapsed_s: float = 0.0     # "playhead" time in seconds
-        self.playback_progress: float = 0.0      # float index progress (i + frac)
+        self.playback_elapsed_s: float = 0.0
+        self.playback_progress: float = 0.0
+        self._auto_hid_full_path: bool = False
 
         # JS queue to avoid calling functions before page is ready
         self.map_ready = False
@@ -155,19 +154,37 @@ class MainWindow(QMainWindow):
         self.play_slider.setValue(0)
         left_layout.addWidget(self.play_slider)
 
+        # Time label row
         row2 = QWidget()
         row2_layout = QHBoxLayout(row2)
         row2_layout.setContentsMargins(0, 0, 0, 0)
 
         self.time_label = QLabel("0:00 / 0:00")
         row2_layout.addWidget(self.time_label)
+        row2_layout.addStretch(1)
+        left_layout.addWidget(row2)
+
+        # Toggle row: Follow, Smooth, Show full path
+        row3 = QWidget()
+        row3_layout = QHBoxLayout(row3)
+        row3_layout.setContentsMargins(0, 0, 0, 0)
 
         self.follow_checkbox = QCheckBox("Follow")
         self.follow_checkbox.setEnabled(False)
-        row2_layout.addWidget(self.follow_checkbox)
+        row3_layout.addWidget(self.follow_checkbox)
 
-        row2_layout.addStretch(1)
-        left_layout.addWidget(row2)
+        self.smooth_checkbox = QCheckBox("Smooth")
+        self.smooth_checkbox.setChecked(True)
+        self.smooth_checkbox.setEnabled(False)
+        row3_layout.addWidget(self.smooth_checkbox)
+
+        self.show_full_checkbox = QCheckBox("Show full path")
+        self.show_full_checkbox.setChecked(True)
+        self.show_full_checkbox.setEnabled(False)
+        row3_layout.addWidget(self.show_full_checkbox)
+
+        row3_layout.addStretch(1)
+        left_layout.addWidget(row3)
 
         # ---- Export ----
         self.btn_export_kml = QPushButton("Export KML (Google Earth)")
@@ -177,7 +194,7 @@ class MainWindow(QMainWindow):
         # --- UI (map panel) ---
         self.web = QWebEngineView()
 
-        # Allow file:// HTML to load remote resources (Leaflet + tiles + hotline)
+        # Allow file:// HTML to load remote resources
         s = self.web.settings()
         try:
             s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
@@ -196,10 +213,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.web, 7)
         self.setCentralWidget(root)
 
-        # Playback timer (drives animation)
+        # Poll timer (UI sync while JS animates smoothly)
         self.play_timer = QTimer(self)
-        self.play_timer.setInterval(33)  # ~30 FPS
-        self.play_timer.timeout.connect(self.on_play_tick)
+        self.play_timer.setInterval(100)  # 10 Hz UI update
+        self.play_timer.timeout.connect(self.on_poll_tick)
 
         # Signals
         self.btn_scan.clicked.connect(self.scan_test_logs)
@@ -220,6 +237,8 @@ class MainWindow(QMainWindow):
 
         self.speed_combo.currentIndexChanged.connect(self.on_speed_changed)
         self.follow_checkbox.toggled.connect(self.on_follow_toggled)
+        self.smooth_checkbox.toggled.connect(self.on_smooth_toggled)
+        self.show_full_checkbox.toggled.connect(self.on_show_full_toggled)
 
         # Auto-load on startup
         self.scan_test_logs()
@@ -237,6 +256,16 @@ class MainWindow(QMainWindow):
             self.web.page().runJavaScript(code)
         else:
             self._pending_js.append(code)
+
+    # ---------- Toggle handlers ----------
+    def on_follow_toggled(self, checked: bool):
+        self.run_js(f"if (window.setFollowMode) {{ setFollowMode({str(bool(checked)).lower()}); }}")
+
+    def on_smooth_toggled(self, checked: bool):
+        self.run_js(f"if (window.setSmoothPlaybackEnabled) {{ setSmoothPlaybackEnabled({str(bool(checked)).lower()}); }}")
+
+    def on_show_full_toggled(self, checked: bool):
+        self.run_js(f"if (window.setFullPathVisible) {{ setFullPathVisible({str(bool(checked)).lower()}); }}")
 
     # ---------- Data loading ----------
     def scan_test_logs(self):
@@ -265,14 +294,20 @@ class MainWindow(QMainWindow):
         self.speed_combo.setEnabled(False)
         self.play_slider.setEnabled(False)
         self.follow_checkbox.setEnabled(False)
+        self.smooth_checkbox.setEnabled(False)
+        self.show_full_checkbox.setEnabled(False)
 
         self.sessions_by_day = {}
         self.current_track = None
+
         self.pause_playback()
+
         self.timeline_s = []
         self.total_duration_s = 0.0
         self.playback_elapsed_s = 0.0
         self.playback_progress = 0.0
+        self._auto_hid_full_path = False
+
         self.update_time_label()
 
     def on_worker_error(self, msg: str):
@@ -301,6 +336,9 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.speed_combo.setEnabled(False)
         self.follow_checkbox.setEnabled(False)
+        self.smooth_checkbox.setEnabled(False)
+        self.show_full_checkbox.setEnabled(False)
+        self._auto_hid_full_path = False
 
         self.run_js("if (window.clearTrack) { clearTrack(); }")
 
@@ -338,6 +376,9 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.speed_combo.setEnabled(False)
         self.follow_checkbox.setEnabled(False)
+        self.smooth_checkbox.setEnabled(False)
+        self.show_full_checkbox.setEnabled(False)
+        self._auto_hid_full_path = False
 
         self.status.setText(f"{day}: {len(metas)} session(s). Select one to plot.")
         self.run_js("if (window.clearTrack) { clearTrack(); }")
@@ -359,6 +400,9 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.speed_combo.setEnabled(False)
         self.follow_checkbox.setEnabled(False)
+        self.smooth_checkbox.setEnabled(False)
+        self.show_full_checkbox.setEnabled(False)
+        self._auto_hid_full_path = False
 
         self.current_track = None
 
@@ -375,18 +419,15 @@ class MainWindow(QMainWindow):
 
         self.current_track = track
 
-        # Default to Progress when a new session is loaded
+        # Default metric
         self.metric_combo.setEnabled(True)
         self.metric_combo.blockSignals(True)
         self.metric_combo.setCurrentText("Progress")
         self.metric_combo.blockSignals(False)
 
-        # Build playback timeline (time-based if timestamps are usable, else fallback)
+        # Timeline
         self.timeline_s = self.build_timeline_seconds(track)
         self.total_duration_s = self.timeline_s[-1] if self.timeline_s else 0.0
-
-        # Reset playback to start
-        self.pause_playback()
         self.playback_elapsed_s = 0.0
         self.playback_progress = 0.0
 
@@ -403,24 +444,35 @@ class MainWindow(QMainWindow):
         self.btn_play_pause.setEnabled(True)
         self.btn_stop.setEnabled(True)
         self.speed_combo.setEnabled(True)
+
         self.follow_checkbox.setEnabled(True)
+        self.follow_checkbox.setChecked(False)
+
+        self.smooth_checkbox.setEnabled(True)
+        self.smooth_checkbox.setChecked(True)
+
+        self.show_full_checkbox.setEnabled(True)
+        self.show_full_checkbox.setChecked(True)
 
         self.btn_export_kml.setEnabled(True)
 
-        # Plot map + set playback position to start (drone icon + empty trail)
+        # Plot + send timeline to JS
         self.plot_current_track()
-        self.push_playback_progress()
+        self.send_timeline_to_js()
+
+        # Apply toggles
+        self.on_smooth_toggled(self.smooth_checkbox.isChecked())
+        self.on_show_full_toggled(self.show_full_checkbox.isChecked())
+        self.on_follow_toggled(self.follow_checkbox.isChecked())
+
+        # Reset JS playback to start
+        self.run_js("if (window.stopPlayback) { stopPlayback(); }")
 
         self.update_time_label()
         self.status.setText(f"Loaded {len(track)} points. Ready to play.")
 
     # ---------- Timeline building ----------
     def build_timeline_seconds(self, track: list[TrackPoint]) -> list[float]:
-        """
-        Returns monotonic elapsed seconds for each point.
-        Prefers timestamps if present; falls back to 1s-per-point if not.
-        """
-        # Estimate dt from timestamp diffs if possible
         diffs = []
         prev_t = None
         for p in track:
@@ -428,13 +480,12 @@ class MainWindow(QMainWindow):
                 continue
             if prev_t is not None:
                 d = (p.t - prev_t).total_seconds()
-                if 0 < d < 300:  # ignore huge gaps
+                if 0 < d < 300:
                     diffs.append(d)
             prev_t = p.t
 
         dt_est = statistics.median(diffs) if diffs else 1.0
 
-        # First valid timestamp
         base = None
         for p in track:
             if p.t is not None:
@@ -442,7 +493,6 @@ class MainWindow(QMainWindow):
                 break
 
         if base is None:
-            # No timestamps at all: assume 1s per point
             return [i * 1.0 for i in range(len(track))]
 
         timeline = []
@@ -452,24 +502,43 @@ class MainWindow(QMainWindow):
                 last = last + dt_est
             else:
                 delta = (p.t - base).total_seconds()
-                # enforce monotonic
                 if delta < last:
                     delta = last + dt_est
                 last = delta
             timeline.append(last)
 
-        # if something weird happens, fallback safely
         if not timeline or timeline[-1] < 0:
             return [i * 1.0 for i in range(len(track))]
 
         return timeline
 
+    def send_timeline_to_js(self):
+        if not self.timeline_s:
+            return
+        self.run_js(f"if (window.setTimelineSeconds) {{ setTimelineSeconds({json.dumps(self.timeline_s)}); }}")
+
     # ---------- Gradient plotting ----------
     def on_metric_changed(self, _idx: int):
-        if self.current_track:
-            # Recolor the whole path but keep playhead position
-            self.plot_current_track()
-            self.push_playback_progress()
+        if not self.current_track:
+            return
+
+        cur_time = float(self.playback_elapsed_s)
+        was_playing = self.playing
+
+        self.pause_playback()
+
+        self.plot_current_track()
+        self.send_timeline_to_js()
+
+        self.on_smooth_toggled(self.smooth_checkbox.isChecked())
+        self.on_show_full_toggled(self.show_full_checkbox.isChecked())
+        self.on_follow_toggled(self.follow_checkbox.isChecked())
+        self.on_speed_changed(self.speed_combo.currentIndex())
+
+        self.seek_to_time(cur_time)
+
+        if was_playing:
+            self.start_playback()
 
     def plot_current_track(self):
         if not self.current_track:
@@ -497,13 +566,7 @@ class MainWindow(QMainWindow):
         if metric == "Progress":
             values = [(i / (n - 1)) if n > 1 else 0.0 for i in range(n)]
             vmin, vmax = 0.0, 1.0
-            meta = {
-                "title": "Progress",
-                "min": vmin,
-                "max": vmax,
-                "label_min": "Start",
-                "label_max": "End",
-            }
+            meta = {"title": "Progress", "min": vmin, "max": vmax, "label_min": "Start", "label_max": "End"}
 
         elif metric == "RSSI":
             raw = [p.rssi_db for p in track]
@@ -511,13 +574,7 @@ class MainWindow(QMainWindow):
             if not present:
                 return None
             vmin, vmax = min(present), max(present)
-            meta = {
-                "title": "RSSI (dB)",
-                "min": vmin,
-                "max": vmax,
-                "label_min": f"{vmin:.0f} dB",
-                "label_max": f"{vmax:.0f} dB",
-            }
+            meta = {"title": "RSSI (dB)", "min": vmin, "max": vmax, "label_min": f"{vmin:.0f} dB", "label_max": f"{vmax:.0f} dB"}
             values = raw
 
         elif metric == "Speed":
@@ -526,13 +583,7 @@ class MainWindow(QMainWindow):
             if not present:
                 return None
             vmin, vmax = min(present), max(present)
-            meta = {
-                "title": "Speed (km/h)",
-                "min": vmin,
-                "max": vmax,
-                "label_min": f"{vmin:.1f} km/h",
-                "label_max": f"{vmax:.1f} km/h",
-            }
+            meta = {"title": "Speed (km/h)", "min": vmin, "max": vmax, "label_min": f"{vmin:.1f} km/h", "label_max": f"{vmax:.1f} km/h"}
             values = raw
 
         elif metric == "Altitude":
@@ -541,13 +592,7 @@ class MainWindow(QMainWindow):
             if not present:
                 return None
             vmin, vmax = min(present), max(present)
-            meta = {
-                "title": "Altitude (m)",
-                "min": vmin,
-                "max": vmax,
-                "label_min": f"{vmin:.1f} m",
-                "label_max": f"{vmax:.1f} m",
-            }
+            meta = {"title": "Altitude (m)", "min": vmin, "max": vmax, "label_min": f"{vmin:.1f} m", "label_max": f"{vmax:.1f} m"}
             values = raw
 
         else:
@@ -556,7 +601,6 @@ class MainWindow(QMainWindow):
         if abs(meta["max"] - meta["min"]) < 1e-12:
             meta["max"] = meta["min"] + 1e-6
 
-        # Fill missing values (so every point has z)
         filled = []
         last_val = None
         for v in values:
@@ -573,13 +617,10 @@ class MainWindow(QMainWindow):
         data = [[p.lat, p.lon, float(z)] for p, z in zip(track, filled)]
         return data, meta
 
-    # ---------- Playback ----------
-    def on_follow_toggled(self, checked: bool):
-        self.run_js(f"if (window.setFollowMode) {{ setFollowMode({str(bool(checked)).lower()}); }}")
-
+    # ---------- Playback control (JS-driven) ----------
     def on_speed_changed(self, _idx: int):
-        # no immediate action needed; next tick uses the new multiplier
-        pass
+        mult = self.get_speed_multiplier()
+        self.run_js(f"if (window.setPlaybackSpeed) {{ setPlaybackSpeed({mult}); }}")
 
     def get_speed_multiplier(self) -> float:
         t = self.speed_combo.currentText().strip().lower().replace("x", "")
@@ -593,12 +634,12 @@ class MainWindow(QMainWindow):
         cur = max(0.0, min(self.playback_elapsed_s, total))
         self.time_label.setText(f"{_format_time(cur)} / {_format_time(total)}")
 
-    def push_playback_progress(self):
-        """Send current playhead progress to JS (marker + trail)."""
-        if not self.current_track:
-            return
-        js = f"if (window.setPlaybackProgress) {{ setPlaybackProgress({float(self.playback_progress):.6f}); }}"
-        self.run_js(js)
+    def set_playing_ui(self, playing: bool):
+        self.playing = playing
+        if playing:
+            self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        else:
+            self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
 
     def go_to_start(self):
         self.pause_playback()
@@ -615,115 +656,134 @@ class MainWindow(QMainWindow):
     def start_playback(self):
         if not self.current_track:
             return
-        if self.playback_progress >= (len(self.current_track) - 1):
-            # if we're at end, restart
-            self.seek_to_index(0)
 
-        self.playing = True
-        self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        # Auto-hide full path when playback starts
+        if self.show_full_checkbox.isChecked():
+            self._auto_hid_full_path = True
+            self.show_full_checkbox.setChecked(False)
+        else:
+            self._auto_hid_full_path = False
+
+        self.on_speed_changed(self.speed_combo.currentIndex())
+
+        self.run_js("if (window.playPlayback) { playPlayback(); }")
+        self.set_playing_ui(True)
+
         if not self.play_timer.isActive():
             self.play_timer.start()
 
     def pause_playback(self):
-        self.playing = False
-        self.btn_play_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.run_js("if (window.pausePlayback) { pausePlayback(); }")
+        self.set_playing_ui(False)
         if self.play_timer.isActive():
             self.play_timer.stop()
 
     def stop_playback(self):
-        self.pause_playback()
-        self.seek_to_index(0)
+        self.run_js("if (window.stopPlayback) { stopPlayback(); }")
+        self.set_playing_ui(False)
+        if self.play_timer.isActive():
+            self.play_timer.stop()
+
+        self.playback_elapsed_s = 0.0
+        self.playback_progress = 0.0
+        self.update_time_label()
+
+        self.play_slider.blockSignals(True)
+        self.play_slider.setValue(0)
+        self.play_slider.blockSignals(False)
+
+        if self._auto_hid_full_path:
+            self.show_full_checkbox.setChecked(True)
+            self._auto_hid_full_path = False
+
+    def seek_to_time(self, seconds: float):
+        seconds = max(0.0, float(seconds))
+        self.playback_elapsed_s = seconds
+        self.update_time_label()
+        self.run_js(f"if (window.seekPlaybackTime) {{ seekPlaybackTime({seconds}); }}")
 
     def seek_to_index(self, idx: int):
         if not self.current_track:
             return
         idx = max(0, min(int(idx), len(self.current_track) - 1))
-        # Move playhead to the time at that index
+
         if self.timeline_s and idx < len(self.timeline_s):
             self.playback_elapsed_s = float(self.timeline_s[idx])
         else:
             self.playback_elapsed_s = float(idx)
 
         self.playback_progress = float(idx)
+        self.update_time_label()
 
-        # Update UI + map
         self.play_slider.blockSignals(True)
         self.play_slider.setValue(idx)
         self.play_slider.blockSignals(False)
 
-        self.update_time_label()
-        self.push_playback_progress()
+        self.run_js(f"if (window.seekPlaybackIndex) {{ seekPlaybackIndex({idx}); }}")
 
+    # ---------- Slider events ----------
     def on_slider_pressed(self):
         self.user_scrubbing = True
         self.pause_playback()
 
     def on_slider_moved(self, value: int):
-        # live scrub
         self.seek_to_index(value)
 
     def on_slider_released(self):
         self.user_scrubbing = False
 
     def on_slider_value_changed(self, value: int):
-        # Handles keyboard adjustments (left/right arrow) too
         if self.user_scrubbing:
             return
-        # If user clicked the slider groove, valueChanged fires without sliderMoved
+        self.pause_playback()
         self.seek_to_index(value)
 
-    def on_play_tick(self):
-        if not self.playing or not self.current_track:
+    # ---------- Poll JS playback status ----------
+    def on_poll_tick(self):
+        if not self.map_ready:
+            return
+        self.web.page().runJavaScript(
+            "window.getPlaybackStatus ? getPlaybackStatus() : null;",
+            self.on_js_playback_status,
+        )
+
+    def on_js_playback_status(self, res):
+        if not isinstance(res, dict):
             return
 
-        dt = self.play_timer.interval() / 1000.0
-        speed = self.get_speed_multiplier()
+        try:
+            t = float(res.get("time", 0.0))
+        except Exception:
+            t = 0.0
+        try:
+            dur = float(res.get("duration", self.total_duration_s or 0.0))
+        except Exception:
+            dur = self.total_duration_s or 0.0
+        try:
+            progress = float(res.get("progress", 0.0))
+        except Exception:
+            progress = 0.0
+        js_playing = bool(res.get("playing", False))
 
-        if not self.timeline_s or len(self.timeline_s) != len(self.current_track):
-            # fallback
-            self.timeline_s = [float(i) for i in range(len(self.current_track))]
-            self.total_duration_s = self.timeline_s[-1] if self.timeline_s else 0.0
+        self.playback_elapsed_s = t
+        self.total_duration_s = dur
+        self.playback_progress = progress
 
-        self.playback_elapsed_s += dt * speed
-
-        # clamp to end
-        if self.playback_elapsed_s >= self.total_duration_s:
-            self.playback_elapsed_s = self.total_duration_s
-            self.playback_progress = float(len(self.current_track) - 1)
-            self.push_playback_progress()
-            self.update_time_label()
-
-            # snap slider to end
-            self.play_slider.blockSignals(True)
-            self.play_slider.setValue(len(self.current_track) - 1)
-            self.play_slider.blockSignals(False)
-
-            self.pause_playback()
-            self.status.setText("Playback finished.")
-            return
-
-        # Find segment for current time
-        # i is the last index where timeline[i] <= elapsed
-        i = bisect.bisect_right(self.timeline_s, self.playback_elapsed_s) - 1
-        i = max(0, min(i, len(self.timeline_s) - 2))
-
-        t0 = self.timeline_s[i]
-        t1 = self.timeline_s[i + 1]
-        frac = 0.0 if (t1 <= t0) else (self.playback_elapsed_s - t0) / (t1 - t0)
-        frac = max(0.0, min(1.0, frac))
-
-        self.playback_progress = float(i) + float(frac)
-
-        # Update map
-        self.push_playback_progress()
-
-        # Update slider (integer)
         if not self.user_scrubbing:
+            i = int(progress)
+            i = max(0, min(i, self.play_slider.maximum()))
             self.play_slider.blockSignals(True)
             self.play_slider.setValue(i)
             self.play_slider.blockSignals(False)
 
         self.update_time_label()
+
+        # If JS stopped (end reached), update UI state
+        if self.playing and not js_playing:
+            self.set_playing_ui(False)
+            if self.play_timer.isActive():
+                self.play_timer.stop()
+            self.status.setText("Playback finished.")
 
     # ---------- Export ----------
     def export_kml(self):
@@ -740,7 +800,7 @@ class MainWindow(QMainWindow):
             self.current_track,
             out_path,
             name="EdgeTX Flight Session",
-            altitude_mode="relativeToGround",  # change to "absolute" if your Alt is MSL
+            altitude_mode="relativeToGround",
         )
         QMessageBox.information(self, "Export complete", f"Saved KML:\n{out_path}\n\nOpen in Google Earth for 3D view.")
 

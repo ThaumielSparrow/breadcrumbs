@@ -81,22 +81,40 @@
 <script>
   var map = null;
 
-  // Full route (static) and trail route (growing during playback)
+  // Full route (static) + trail (growing) + head (dynamic partial segment)
   var fullLayer = null;
   var trailLayer = null;
+  var headLayer = null;
 
   // Markers
   var startMarker = null;
   var endMarker = null;
   var droneMarker = null;
 
-  // Track state
+  // Track data
   var fullData = null;       // [[lat, lon, z], ...]
   var fullMeta = null;
-  var lastTrailIndex = -1;   // last integer point included in trail
-  var followMode = false;
 
-  // Viridis-ish palette (nice for telemetry)
+  // Playback timeline
+  var timelineS = null;      // [seconds...], same length as fullData
+  var durationS = 0.0;
+
+  // Playback state (JS-driven for smoothness)
+  var playing = false;
+  var speedMult = 1.0;
+  var playheadS = 0.0;
+  var lastFrameMs = null;
+
+  // Render cache
+  var lastTrailIndex = -1;   // last integer point included in trail
+  var lastProgress = 0.0;    // float index progress
+
+  // Toggles
+  var followMode = false;
+  var fullPathVisible = true;
+  var smoothEnabled = true;
+
+  // Viridis-ish palette
   var palette = {
     0.0: "#440154",
     0.25: "#3b528b",
@@ -152,7 +170,7 @@
     legend.style.display = "block";
   }
 
-  // Simple quadcopter-ish SVG icon (inline data URL)
+  // Simple quadcopter-ish SVG icon (inline)
   var quadSvg =
     '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">' +
     '<circle cx="16" cy="16" r="10" fill="#111"/>' +
@@ -178,13 +196,332 @@
     try { if (layer) layer.remove(); } catch (e) {}
   }
 
-  window.setFollowMode = function(enabled) {
-    followMode = !!enabled;
+  function point2d(p) { return [p[0], p[1]]; }
+
+  function hotlineOpts(meta, weight) {
+    return {
+      min: meta && typeof meta.min === "number" ? meta.min : 0,
+      max: meta && typeof meta.max === "number" ? meta.max : 1,
+      palette: palette,
+      weight: weight,
+      outlineWidth: 1,
+      outlineColor: "#000",
+      opacity: 1.0
+    };
+  }
+
+  function makeRouteLayer(data3, meta, weight) {
+    if (L.hotline) {
+      return L.hotline(data3, hotlineOpts(meta, weight));
+    }
+    return L.polyline(data3.map(point2d), { weight: weight });
+  }
+
+  function applyFullVisibilityNow() {
+    if (!map || !fullLayer) return;
+    try {
+      if (fullPathVisible) {
+        if (!map.hasLayer(fullLayer)) fullLayer.addTo(map);
+      } else {
+        if (map.hasLayer(fullLayer)) fullLayer.remove();
+      }
+    } catch (e) {
+      // fallback: style
+      try { fullLayer.setStyle({ opacity: fullPathVisible ? 1.0 : 0.0 }); } catch (e2) {}
+    }
+  }
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  function computeDuration() {
+    if (timelineS && timelineS.length) {
+      durationS = Number(timelineS[timelineS.length - 1]) || 0.0;
+    } else if (fullData && fullData.length) {
+      durationS = fullData.length - 1;
+    } else {
+      durationS = 0.0;
+    }
+  }
+
+  // Find rightmost index i where timelineS[i] <= t (like bisect_right - 1).
+  function bisectRightMinus1(arr, t) {
+    var lo = 0;
+    var hi = arr.length - 1;
+    while (lo < hi) {
+      var mid = (lo + hi + 1) >> 1;
+      if (arr[mid] <= t) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  }
+
+  function timeToProgress(t) {
+    if (!fullData || fullData.length < 2) return 0.0;
+    var n = fullData.length;
+
+    if (!timelineS || timelineS.length !== n) {
+      var p = clamp(t, 0.0, n - 1);
+      return p;
+    }
+
+    if (t <= timelineS[0]) return 0.0;
+    if (t >= timelineS[n - 1]) return n - 1;
+
+    var i = bisectRightMinus1(timelineS, t);
+    i = clamp(i, 0, n - 2);
+
+    var t0 = timelineS[i];
+    var t1 = timelineS[i + 1];
+    var frac = (t1 > t0) ? ((t - t0) / (t1 - t0)) : 0.0;
+    frac = clamp(frac, 0.0, 1.0);
+
+    if (!smoothEnabled) frac = 0.0;
+    return i + frac;
+  }
+
+  function ensureTrailToIndex(targetIndex) {
+    if (!fullData || fullData.length < 2) return;
+
+    if (targetIndex < 1) {
+      removeLayerSafe(trailLayer); trailLayer = null;
+      removeLayerSafe(headLayer); headLayer = null;
+      lastTrailIndex = targetIndex;
+      return;
+    }
+
+    if (!trailLayer) {
+      var sub = fullData.slice(0, targetIndex + 1);
+      trailLayer = makeRouteLayer(sub, fullMeta, 9);
+      trailLayer.addTo(map);
+      lastTrailIndex = targetIndex;
+      return;
+    }
+
+    var bigJump = (lastTrailIndex >= 0) ? (Math.abs(targetIndex - lastTrailIndex) > 500) : true;
+    if (targetIndex < lastTrailIndex || bigJump) {
+      removeLayerSafe(trailLayer); trailLayer = null;
+      var sub2 = fullData.slice(0, targetIndex + 1);
+      trailLayer = makeRouteLayer(sub2, fullMeta, 9);
+      trailLayer.addTo(map);
+      lastTrailIndex = targetIndex;
+      return;
+    }
+
+    if (targetIndex > lastTrailIndex) {
+      for (var j = lastTrailIndex + 1; j <= targetIndex; j++) {
+        try {
+          if (L.hotline) {
+            trailLayer.addLatLng(fullData[j]);     // [lat,lon,z]
+          } else {
+            trailLayer.addLatLng(point2d(fullData[j]));
+          }
+        } catch (e) {
+          removeLayerSafe(trailLayer); trailLayer = null;
+          var sub3 = fullData.slice(0, targetIndex + 1);
+          trailLayer = makeRouteLayer(sub3, fullMeta, 9);
+          trailLayer.addTo(map);
+          break;
+        }
+      }
+      lastTrailIndex = targetIndex;
+    }
+  }
+
+  function updateHeadSegment(i, lat, lon, z, frac) {
+    if (!smoothEnabled || frac <= 0.0) {
+      removeLayerSafe(headLayer); headLayer = null;
+      return;
+    }
+    if (!fullData || i < 0 || i >= fullData.length - 1) {
+      removeLayerSafe(headLayer); headLayer = null;
+      return;
+    }
+
+    var a = fullData[i];
+    var b = [lat, lon, z];
+    var headData = [a, b];
+
+    if (!headLayer) {
+      headLayer = makeRouteLayer(headData, fullMeta, 9);
+      headLayer.addTo(map);
+      return;
+    }
+
+    try {
+      if (L.hotline) headLayer.setLatLngs(headData);
+      else headLayer.setLatLngs(headData.map(point2d));
+    } catch (e) {
+      removeLayerSafe(headLayer); headLayer = null;
+      headLayer = makeRouteLayer(headData, fullMeta, 9);
+      headLayer.addTo(map);
+    }
+  }
+
+  function renderAtTime(t) {
+    if (!ensureMap()) return;
+    if (!fullData || fullData.length < 2) return;
+
+    computeDuration();
+    playheadS = clamp(t, 0.0, durationS);
+
+    var prog = timeToProgress(playheadS);
+    lastProgress = prog;
+
+    var n = fullData.length;
+    var p = clamp(prog, 0.0, n - 1);
+    var i = Math.floor(p);
+    var frac = p - i;
+
+    if (!smoothEnabled) frac = 0.0;
+
+    var a = fullData[i];
+    var b = (i + 1 < n) ? fullData[i + 1] : fullData[i];
+
+    var lat = a[0] + (b[0] - a[0]) * frac;
+    var lon = a[1] + (b[1] - a[1]) * frac;
+
+    var zA = (a.length > 2) ? a[2] : 0.0;
+    var zB = (b.length > 2) ? b[2] : zA;
+    var z = zA + (zB - zA) * frac;
+
+    ensureQuadIcon();
+    if (!droneMarker) {
+      droneMarker = L.marker([lat, lon], { icon: quadIcon, interactive: false }).addTo(map);
+    } else {
+      droneMarker.setLatLng([lat, lon]);
+    }
+
+    if (followMode) map.panTo([lat, lon], { animate: false });
+
+    ensureTrailToIndex(i);
+    updateHeadSegment(i, lat, lon, z, frac);
+  }
+
+  function tick(nowMs) {
+    if (!playing) return;
+
+    if (lastFrameMs === null) lastFrameMs = nowMs;
+    var dt = (nowMs - lastFrameMs) / 1000.0;
+    lastFrameMs = nowMs;
+
+    // Avoid massive leaps after stalls
+    dt = clamp(dt, 0.0, 0.25);
+
+    renderAtTime(playheadS + dt * speedMult);
+
+    if (playheadS >= durationS - 1e-9) {
+      playing = false;
+      return;
+    }
+
+    requestAnimationFrame(tick);
+  }
+
+  // ----- Public API for Python -----
+
+  window.setFollowMode = function(enabled) { followMode = !!enabled; };
+
+  window.setFullPathVisible = function(enabled) {
+    fullPathVisible = !!enabled;
+    applyFullVisibilityNow();
+  };
+
+  window.setSmoothPlaybackEnabled = function(enabled) {
+    smoothEnabled = !!enabled;
+    renderAtTime(playheadS);
+  };
+
+  window.setPlaybackSpeed = function(mult) {
+    var m = Number(mult);
+    if (!isFinite(m) || m <= 0) m = 1.0;
+    speedMult = m;
+  };
+
+  window.setTimelineSeconds = function(timeline) {
+    if (Array.isArray(timeline) && timeline.length) timelineS = timeline;
+    else timelineS = null;
+    computeDuration();
+    playheadS = clamp(playheadS, 0.0, durationS);
+  };
+
+  window.playPlayback = function() {
+    if (!ensureMap()) return;
+    if (!fullData || fullData.length < 2) return;
+
+    computeDuration();
+    playing = true;
+    lastFrameMs = null;
+    requestAnimationFrame(tick);
+  };
+
+  window.pausePlayback = function() {
+    playing = false;
+  };
+
+  window.stopPlayback = function() {
+    playing = false;
+    lastFrameMs = null;
+    renderAtTime(0.0);
+  };
+
+  window.seekPlaybackTime = function(t) {
+    playing = false;
+    lastFrameMs = null;
+    renderAtTime(Number(t) || 0.0);
+  };
+
+  window.seekPlaybackIndex = function(idx) {
+    if (!fullData || fullData.length < 2) return;
+    var i = clamp(Math.floor(Number(idx) || 0), 0, fullData.length - 1);
+
+    var t = 0.0;
+    if (timelineS && timelineS.length === fullData.length) t = Number(timelineS[i]) || 0.0;
+    else t = i;
+
+    playing = false;
+    lastFrameMs = null;
+    renderAtTime(t);
+  };
+
+  // Back-compat: accept a float index progress
+  window.setPlaybackProgress = function(progress) {
+    if (!fullData || fullData.length < 2) return;
+    var n = fullData.length;
+    var p = clamp(Number(progress) || 0.0, 0.0, n - 1);
+    var i = Math.floor(p);
+    var frac = p - i;
+
+    var t = 0.0;
+    if (timelineS && timelineS.length === n) {
+      var t0 = Number(timelineS[i]) || 0.0;
+      var t1 = Number(timelineS[Math.min(i + 1, n - 1)]) || t0;
+      t = t0 + (t1 - t0) * frac;
+    } else {
+      t = p;
+    }
+    window.seekPlaybackTime(t);
+  };
+
+  window.getPlaybackStatus = function() {
+    computeDuration();
+    return {
+      time: playheadS,
+      duration: durationS,
+      playing: playing,
+      progress: lastProgress
+    };
   };
 
   window.clearTrack = function() {
+    playing = false;
+    lastFrameMs = null;
+    playheadS = 0.0;
+    lastProgress = 0.0;
+    lastTrailIndex = -1;
+
     removeLayerSafe(fullLayer); fullLayer = null;
     removeLayerSafe(trailLayer); trailLayer = null;
+    removeLayerSafe(headLayer); headLayer = null;
 
     removeLayerSafe(startMarker); startMarker = null;
     removeLayerSafe(endMarker); endMarker = null;
@@ -192,12 +529,12 @@
 
     fullData = null;
     fullMeta = null;
-    lastTrailIndex = -1;
+    timelineS = null;
+    durationS = 0.0;
 
     setLegend(null);
   };
 
-  // Main plot call from Python (still works for non-playback viewing)
   window.plotHotline = function(data, meta) {
     if (!ensureMap()) return;
 
@@ -210,140 +547,29 @@
 
     fullData = data;
     fullMeta = meta || null;
+    computeDuration();
 
-    // If plugin isn't available, fallback to normal polyline (no gradient)
-    if (!L.hotline) {
-      var coords2d = data.map(function(p){ return [p[0], p[1]]; });
-      fullLayer = L.polyline(coords2d, { weight: 5 }).addTo(map);
+    fullLayer = makeRouteLayer(fullData, fullMeta, 6);
+    fullLayer.addTo(map);
+
+    try {
       map.fitBounds(fullLayer.getBounds(), { padding: [20, 20] });
-      startMarker = L.marker(coords2d[0]).addTo(map).bindPopup("Start");
-      endMarker = L.marker(coords2d[coords2d.length - 1]).addTo(map).bindPopup("Last");
-      setLegend(meta);
-      return;
-    }
+    } catch (e) {}
 
-    fullLayer = L.hotline(data, {
-      min: meta && typeof meta.min === "number" ? meta.min : 0,
-      max: meta && typeof meta.max === "number" ? meta.max : 1,
-      palette: palette,
-      weight: 6,
-      outlineWidth: 1,
-      outlineColor: "#000",
-      opacity: 1.0
-    }).addTo(map);
-
-    map.fitBounds(fullLayer.getBounds(), { padding: [20, 20] });
-
-    var start = [data[0][0], data[0][1]];
-    var end = [data[data.length - 1][0], data[data.length - 1][1]];
+    var start = [fullData[0][0], fullData[0][1]];
+    var end = [fullData[fullData.length - 1][0], fullData[fullData.length - 1][1]];
     startMarker = L.marker(start).addTo(map).bindPopup("Start");
     endMarker = L.marker(end).addTo(map).bindPopup("Last");
 
-    setLegend(meta);
+    setLegend(fullMeta);
+    applyFullVisibilityNow();
 
-    // Put drone at start and clear trail initially
-    window.setPlaybackProgress(0.0);
+    // Initialize drone + empty trail at start
+    renderAtTime(0.0);
   };
 
-  // Backwards compatibility
+  // Backward compatibility
   window.plotTrack = window.plotHotline;
-
-  // Playback: progress is float [0 .. N-1]
-  window.setPlaybackProgress = function(progress) {
-    if (!ensureMap()) return;
-    if (!fullData || fullData.length < 2) return;
-
-    var n = fullData.length;
-    var p = Math.max(0, Math.min(progress, n - 1));
-    var i = Math.floor(p);
-    var frac = p - i;
-
-    // Interpolate marker position between point i and i+1
-    var a = fullData[i];
-    var b = (i + 1 < n) ? fullData[i + 1] : fullData[i];
-    var lat = a[0] + (b[0] - a[0]) * frac;
-    var lon = a[1] + (b[1] - a[1]) * frac;
-
-    ensureQuadIcon();
-    if (!droneMarker) {
-      droneMarker = L.marker([lat, lon], { icon: quadIcon, interactive: false }).addTo(map);
-    } else {
-      droneMarker.setLatLng([lat, lon]);
-    }
-
-    if (followMode) {
-      // Pan gently; avoid heavy animation
-      map.panTo([lat, lon], { animate: false });
-    }
-
-    // Trail uses the same gradient metric as the full path.
-    // We update trail only when integer index increases (or scrubbing goes backward).
-    var targetIndex = Math.max(0, Math.min(i, n - 1));
-
-    // If at very beginning, clear trail
-    if (targetIndex < 1) {
-      removeLayerSafe(trailLayer); trailLayer = null;
-      lastTrailIndex = targetIndex;
-      return;
-    }
-
-    // If trail doesn't exist yet, create it with first 2 points
-    if (!trailLayer && L.hotline) {
-      var initData = fullData.slice(0, 2);
-      trailLayer = L.hotline(initData, {
-        min: fullMeta && typeof fullMeta.min === "number" ? fullMeta.min : 0,
-        max: fullMeta && typeof fullMeta.max === "number" ? fullMeta.max : 1,
-        palette: palette,
-        weight: 9,
-        outlineWidth: 1,
-        outlineColor: "#000",
-        opacity: 1.0
-      }).addTo(map);
-      lastTrailIndex = 1;
-    }
-
-    // If plugin missing, we can't do gradient trail; just skip trail
-    if (!L.hotline) {
-      lastTrailIndex = targetIndex;
-      return;
-    }
-
-    // Determine whether to rebuild (scrub backwards / big jump) or append incrementally
-    var bigJump = (lastTrailIndex >= 0) ? (Math.abs(targetIndex - lastTrailIndex) > 500) : true;
-    if (targetIndex < lastTrailIndex || bigJump) {
-      // Rebuild trail up to targetIndex
-      removeLayerSafe(trailLayer); trailLayer = null;
-      var sub = fullData.slice(0, targetIndex + 1);
-      trailLayer = L.hotline(sub, {
-        min: fullMeta && typeof fullMeta.min === "number" ? fullMeta.min : 0,
-        max: fullMeta && typeof fullMeta.max === "number" ? fullMeta.max : 1,
-        palette: palette,
-        weight: 9,
-        outlineWidth: 1,
-        outlineColor: "#000",
-        opacity: 1.0
-      }).addTo(map);
-      lastTrailIndex = targetIndex;
-      return;
-    }
-
-    // Append forward incrementally (fast path)
-    if (targetIndex > lastTrailIndex && trailLayer) {
-      for (var j = lastTrailIndex + 1; j <= targetIndex; j++) {
-        // L.Hotline extends L.Polyline, so addLatLng exists
-        try {
-          trailLayer.addLatLng(fullData[j]);
-        } catch (e) {
-          // Fallback: setLatLngs if addLatLng fails
-          try {
-            var sub2 = fullData.slice(0, j + 1);
-            trailLayer.setLatLngs(sub2);
-          } catch (e2) {}
-        }
-      }
-      lastTrailIndex = targetIndex;
-    }
-  };
 
   ensureMap();
 </script>
