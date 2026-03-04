@@ -1,9 +1,8 @@
 import sys
 import os
 import json
-import statistics
 
-from PySide6.QtCore import QObject, Signal, QRunnable, QThreadPool, QUrl, Qt, QTimer
+from PySide6.QtCore import QThreadPool, QUrl, Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -28,38 +27,8 @@ from PySide6.QtWebEngineCore import QWebEngineSettings
 from core.sessions import scan_logs_dir, SessionMeta
 from core.load import load_track, TrackPoint
 from core.export_kml import export_track_to_kml
-
-
-class WorkerSignals(QObject):
-    done = Signal(object)
-    error = Signal(str)
-
-
-class Worker(QRunnable):
-    def __init__(self, fn, *args, **kwargs):
-        super().__init__()
-        self.fn = fn
-        self.args = args
-        self.kwargs = kwargs
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            res = self.fn(*self.args, **self.kwargs)
-            self.signals.done.emit(res)
-        except Exception as e:
-            self.signals.error.emit(str(e))
-
-
-def _format_time(seconds: float) -> str:
-    seconds = max(0.0, float(seconds))
-    s = int(seconds)
-    h = s // 3600
-    m = (s % 3600) // 60
-    sec = s % 60
-    if h > 0:
-        return f"{h:d}:{m:02d}:{sec:02d}"
-    return f"{m:d}:{sec:02d}"
+from .worker import Worker, format_time
+from .plotting import build_timeline_seconds, build_hotline_payload
 
 
 class MainWindow(QMainWindow):
@@ -426,7 +395,7 @@ class MainWindow(QMainWindow):
         self.metric_combo.blockSignals(False)
 
         # Timeline
-        self.timeline_s = self.build_timeline_seconds(track)
+        self.timeline_s = build_timeline_seconds(track)
         self.total_duration_s = self.timeline_s[-1] if self.timeline_s else 0.0
         self.playback_elapsed_s = 0.0
         self.playback_progress = 0.0
@@ -472,45 +441,6 @@ class MainWindow(QMainWindow):
         self.status.setText(f"Loaded {len(track)} points. Ready to play.")
 
     # ---------- Timeline building ----------
-    def build_timeline_seconds(self, track: list[TrackPoint]) -> list[float]:
-        diffs = []
-        prev_t = None
-        for p in track:
-            if p.t is None:
-                continue
-            if prev_t is not None:
-                d = (p.t - prev_t).total_seconds()
-                if 0 < d < 300:
-                    diffs.append(d)
-            prev_t = p.t
-
-        dt_est = statistics.median(diffs) if diffs else 1.0
-
-        base = None
-        for p in track:
-            if p.t is not None:
-                base = p.t
-                break
-
-        if base is None:
-            return [i * 1.0 for i in range(len(track))]
-
-        timeline = []
-        last = 0.0
-        for p in track:
-            if p.t is None:
-                last = last + dt_est
-            else:
-                delta = (p.t - base).total_seconds()
-                if delta < last:
-                    delta = last + dt_est
-                last = delta
-            timeline.append(last)
-
-        if not timeline or timeline[-1] < 0:
-            return [i * 1.0 for i in range(len(track))]
-
-        return timeline
 
     def send_timeline_to_js(self):
         if not self.timeline_s:
@@ -545,77 +475,20 @@ class MainWindow(QMainWindow):
             return
 
         metric = self.metric_combo.currentText()
-        data_meta = self.build_hotline_payload(self.current_track, metric)
+        data_meta = build_hotline_payload(self.current_track, metric)
 
         if data_meta is None:
             self.status.setText(f"No {metric} data available; falling back to Progress.")
             self.metric_combo.blockSignals(True)
             self.metric_combo.setCurrentText("Progress")
             self.metric_combo.blockSignals(False)
-            data_meta = self.build_hotline_payload(self.current_track, "Progress")
+            data_meta = build_hotline_payload(self.current_track, "Progress")
 
         data, meta = data_meta # type:ignore
         js = f"if (window.plotHotline) {{ plotHotline({json.dumps(data)}, {json.dumps(meta)}); }}"
         self.run_js(js)
 
-    def build_hotline_payload(self, track: list[TrackPoint], metric: str):
-        n = len(track)
-        if n < 2:
-            return None
 
-        if metric == "Progress":
-            values = [(i / (n - 1)) if n > 1 else 0.0 for i in range(n)]
-            vmin, vmax = 0.0, 1.0
-            meta = {"title": "Progress", "min": vmin, "max": vmax, "label_min": "Start", "label_max": "End"}
-
-        elif metric == "RSSI":
-            raw = [p.rssi_db for p in track]
-            present = [v for v in raw if v is not None]
-            if not present:
-                return None
-            vmin, vmax = min(present), max(present)
-            meta = {"title": "RSSI (dB)", "min": vmin, "max": vmax, "label_min": f"{vmin:.0f} dB", "label_max": f"{vmax:.0f} dB"}
-            values = raw
-
-        elif metric == "Speed":
-            raw = [p.speed_kmh for p in track]
-            present = [v for v in raw if v is not None]
-            if not present:
-                return None
-            vmin, vmax = min(present), max(present)
-            meta = {"title": "Speed (km/h)", "min": vmin, "max": vmax, "label_min": f"{vmin:.1f} km/h", "label_max": f"{vmax:.1f} km/h"}
-            values = raw
-
-        elif metric == "Altitude":
-            raw = [p.alt_m for p in track]
-            present = [v for v in raw if v is not None]
-            if not present:
-                return None
-            vmin, vmax = min(present), max(present)
-            meta = {"title": "Altitude (m)", "min": vmin, "max": vmax, "label_min": f"{vmin:.1f} m", "label_max": f"{vmax:.1f} m"}
-            values = raw
-
-        else:
-            return None
-
-        if abs(meta["max"] - meta["min"]) < 1e-12:
-            meta["max"] = meta["min"] + 1e-6
-
-        filled = []
-        last_val = None
-        for v in values:
-            if v is None:
-                filled.append(last_val)
-            else:
-                filled.append(float(v))
-                last_val = float(v)
-
-        first_non = next((v for v in filled if v is not None), None)
-        fallback = first_non if first_non is not None else float(meta["min"])
-        filled = [fallback if v is None else v for v in filled]
-
-        data = [[p.lat, p.lon, float(z)] for p, z in zip(track, filled)]
-        return data, meta
 
     # ---------- Playback control (JS-driven) ----------
     def on_speed_changed(self, _idx: int):
@@ -632,7 +505,7 @@ class MainWindow(QMainWindow):
     def update_time_label(self):
         total = self.total_duration_s if self.total_duration_s > 0 else 0.0
         cur = max(0.0, min(self.playback_elapsed_s, total))
-        self.time_label.setText(f"{_format_time(cur)} / {_format_time(total)}")
+        self.time_label.setText(f"{format_time(cur)} / {format_time(total)}")
 
     def set_playing_ui(self, playing: bool):
         self.playing = playing
@@ -743,11 +616,18 @@ class MainWindow(QMainWindow):
         if not self.map_ready:
             return
         self.web.page().runJavaScript(
-            "window.getPlaybackStatus ? getPlaybackStatus() : null;",
+            "JSON.stringify(window.getPlaybackStatus ? getPlaybackStatus() : {});",
             self.on_js_playback_status,
         )
 
     def on_js_playback_status(self, res):
+        # res is a JSON string from JavaScript, parse it
+        if isinstance(res, str):
+            try:
+                res = json.loads(res)
+            except Exception:
+                return
+        
         if not isinstance(res, dict):
             return
 
@@ -770,11 +650,13 @@ class MainWindow(QMainWindow):
         self.playback_progress = progress
 
         if not self.user_scrubbing:
-            i = int(progress)
+            # Update slider from JS playback status (with signals blocked)
+            i = round(progress)
             i = max(0, min(i, self.play_slider.maximum()))
             self.play_slider.blockSignals(True)
             self.play_slider.setValue(i)
             self.play_slider.blockSignals(False)
+            self.play_slider.repaint()  # Force visual update
 
         self.update_time_label()
 
