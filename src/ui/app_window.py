@@ -21,14 +21,26 @@ from PySide6.QtWidgets import (
     QStyle,
     QCheckBox,
 )
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage
 
 from core.sessions import scan_logs_dir, SessionMeta
 from core.load import load_track, TrackPoint
 from core.export_kml import export_track_to_kml
 from .worker import Worker, format_time
 from .plotting import build_timeline_seconds, build_hotline_payload
+
+
+class CustomWebEnginePage(QWebEnginePage):
+    def acceptNavigationRequest(self, url, _type, isMainFrame):
+        # If the user clicked a link, open it in the system default browser
+        if _type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
+            QDesktopServices.openUrl(url)
+            return False  # Prevent the QWebEngineView from following the link
+        
+        # Otherwise, let the web engine load the page normally (e.g., your map HTML)
+        return super().acceptNavigationRequest(url, _type, isMainFrame)
 
 
 class MainWindow(QMainWindow):
@@ -81,6 +93,11 @@ class MainWindow(QMainWindow):
         self.metric_combo.addItems(["Progress", "RSSI", "Speed", "Altitude"])
         self.metric_combo.setEnabled(False)
         left_layout.addWidget(self.metric_combo)
+
+        left_layout.addWidget(QLabel("Map Style:"))
+        self.map_style_combo = QComboBox()
+        self.map_style_combo.addItems(["Normal", "Satellite"]) # Terrain option available but unused
+        left_layout.addWidget(self.map_style_combo)
 
         # ---- Playback controls ----
         left_layout.addWidget(QLabel("Playback:"))
@@ -163,6 +180,10 @@ class MainWindow(QMainWindow):
         # --- UI (map panel) ---
         self.web = QWebEngineView()
 
+        # Intercept link click and send to default OS browser
+        self.web_page = CustomWebEnginePage(self.web)
+        self.web.setPage(self.web_page)
+
         # Allow file:// HTML to load remote resources
         s = self.web.settings()
         try:
@@ -193,6 +214,8 @@ class MainWindow(QMainWindow):
         self.session_list.itemClicked.connect(self.on_session_clicked)
         self.metric_combo.currentIndexChanged.connect(self.on_metric_changed)
         self.btn_export_kml.clicked.connect(self.export_kml)
+        self.map_style_combo.currentIndexChanged.connect(self.on_map_style_changed)
+
 
         # Playback signals
         self.btn_to_start.clicked.connect(self.go_to_start)
@@ -235,6 +258,10 @@ class MainWindow(QMainWindow):
 
     def on_show_full_toggled(self, checked: bool):
         self.run_js(f"if (window.setFullPathVisible) {{ setFullPathVisible({str(bool(checked)).lower()}); }}")
+    
+    def on_map_style_changed(self, _idx: int):
+        style = self.map_style_combo.currentText()
+        self.run_js(f"if (window.setBaseMap) {{ setBaseMap('{style}'); }}")
 
     # ---------- Data loading ----------
     def scan_test_logs(self):

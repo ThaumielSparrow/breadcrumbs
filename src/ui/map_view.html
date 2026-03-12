@@ -44,6 +44,13 @@
       opacity: 0.9;
     }
 
+    /* attribution text */
+    .leaflet-control-attribution {
+      font-size: 12px !important;
+      background: rgba(255, 255, 255, 0.75) !important;
+      padding: 2px 5px !important;
+    }
+
     /* Helpful error message if Leaflet fails to load */
     #msg {
       position: absolute;
@@ -80,6 +87,7 @@
 
 <script>
   var map = null;
+  var basemaps = {};
 
   // Full route (static) + trail (growing) + head (dynamic partial segment)
   var fullLayer = null;
@@ -137,10 +145,63 @@
       return false;
     }
 
-    map = L.map("map").setView([0, 0], 2);
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
+    // Disable default bottom-right attribution so we can move it to bottom-left
+    map = L.map("map", {
+      attributionControl: false
+    }).setView([0, 0], 2);
+
+    var customAttribution = L.control.attribution({ position: 'bottomleft' }).addTo(map);
+    customAttribution.setPrefix('');
+
+    // 1. Normal OpenStreetMap
+    var osmLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { 
+      maxZoom: 19,
+      attribution: 'Map data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+    });
+
+    // 2. Esri Satellite Imagery
+    var satLayer = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", { 
+      maxZoom: 19,
+      attribution: 'Powered by <a href="https://www.esri.com/">Esri</a>'
+    });
+
+    // 3. OpenTopoMap (Terrain)
+    // var terLayer = L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", { 
+    //   maxZoom: 17, // TopoMap only supports up to zoom level 17
+    //   attribution: 'Map data from <a href="https://opentopomap.org/about">OpenTopoMap</a>'
+    // });
+
+    baseMaps = {
+      "Normal": osmLayer,
+      "Satellite": satLayer,
+      // "Terrain": terLayer
+    };
+
+    // Add the default layer
+    osmLayer.addTo(map);
+    
+    // (Optional) Add Leaflet's native layer switcher widget to the top right of the map
+    L.control.layers(baseMaps).addTo(map);
+
     return true;
   }
+
+  // --- Public API for Python to switch base maps ---
+  window.setBaseMap = function(name) {
+    if (!map) return;
+    
+    // Remove currently active base map
+    for (var key in baseMaps) {
+      if (map.hasLayer(baseMaps[key])) {
+        map.removeLayer(baseMaps[key]);
+      }
+    }
+    
+    // Add the selected one
+    if (baseMaps[name]) {
+      baseMaps[name].addTo(map);
+    }
+  };
 
   function gradientCSSFromPalette(p) {
     var stops = Object.keys(p).map(parseFloat).sort(function(a,b){ return a-b; });
