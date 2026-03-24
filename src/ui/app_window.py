@@ -28,6 +28,7 @@ from PySide6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage
 from core.sessions import scan_logs_dir, SessionMeta
 from core.load import load_track, TrackPoint
 from core.export_kml import export_track_to_kml
+from .cache import start_cache_server
 from .worker import Worker, format_time
 from .plotting import build_timeline_seconds, build_hotline_payload
 
@@ -50,6 +51,9 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
 
         self.thread_pool = QThreadPool.globalInstance()
+
+        # Local tile proxy cache
+        self.cache_server, self.cache_port = start_cache_server()
 
         # State
         self.sessions_by_day: dict[str, list[SessionMeta]] = {}
@@ -180,6 +184,9 @@ class MainWindow(QMainWindow):
         # --- UI (map panel) ---
         self.web = QWebEngineView()
 
+        # Remove internal webcache
+        self.web.page().profile().clearHttpCache()
+
         # Intercept link click and send to default OS browser
         self.web_page = CustomWebEnginePage(self.web)
         self.web.setPage(self.web_page)
@@ -238,10 +245,14 @@ class MainWindow(QMainWindow):
     # ---------- JS helpers ----------
     def on_map_loaded(self, ok: bool):
         self.map_ready = bool(ok)
-        if self.map_ready and self._pending_js:
-            for code in self._pending_js:
-                self.web.page().runJavaScript(code)
-            self._pending_js.clear()
+        if self.map_ready:
+            # initialize proxy port before running pending JS
+            self.web.page().runJavaScript(f"if (window.initMap) {{ window.initMap({self.cache_port}); }}") # type:ignore
+
+            if self._pending_js:
+                for code in self._pending_js:
+                    self.web.page().runJavaScript(code)
+                self._pending_js.clear()
 
     def run_js(self, code: str) -> None:
         if self.map_ready:

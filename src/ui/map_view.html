@@ -140,8 +140,10 @@
   function ensureMap() {
     if (map) return true;
 
+    if (!window.CACHE_PORT) return false;
+
     if (typeof L === "undefined") {
-      showMsg("Map error: Leaflet failed to load (L is undefined). If you are using Qt WebEngine, ensure LocalContentCanAccessRemoteUrls is enabled.");
+      showMsg("Map error: Leaflet failed to load (L is undefined).");
       return false;
     }
 
@@ -153,14 +155,18 @@
     var customAttribution = L.control.attribution({ position: 'bottomleft' }).addTo(map);
     customAttribution.setPrefix('');
 
+    // strict URLs only, no direct fallback to internet
+    var osmUrl = "http://127.0.0.1:" + window.CACHE_PORT + "/osm/{z}/{x}/{y}.png";  
+    var satUrl = "http://127.0.0.1:" + window.CACHE_PORT + "/esri/{z}/{x}/{y}.png";
+
     // 1. Normal OpenStreetMap
-    var osmLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { 
+    var osmLayer = L.tileLayer(osmUrl, { 
       maxZoom: 19,
       attribution: 'Map data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
     });
 
     // 2. Esri Satellite Imagery
-    var satLayer = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", { 
+    var satLayer = L.tileLayer(satUrl, { 
       maxZoom: 19,
       attribution: 'Powered by <a href="https://www.esri.com/">Esri</a>'
     });
@@ -180,7 +186,7 @@
     // Add the default layer
     osmLayer.addTo(map);
     
-    // (Optional) Add Leaflet's native layer switcher widget to the top right of the map
+    // Add Leaflet's native layer switcher widget to the top right of the map
     L.control.layers(baseMaps).addTo(map);
 
     return true;
@@ -632,7 +638,10 @@
   // Backward compatibility
   window.plotTrack = window.plotHotline;
 
-  ensureMap();
+  window.initMap = function(port) {
+    window.CACHE_PORT = port;
+    ensureMap();
+  }
 </script>
 </body>
 </html>
