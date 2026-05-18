@@ -16,6 +16,7 @@ class TrackPoint:
     alt_m: Optional[float] = None
     speed_kmh: Optional[float] = None
     rssi_db: Optional[float] = None
+    lq: Optional[float] = None  # link quality (0-100); None when no LQ column was present
 
 
 def _parse_float(s: object) -> Optional[float]:
@@ -99,6 +100,14 @@ def _find_alt_col(header_map: Dict[str, int]) -> Optional[int]:
 
 def _find_speed_col(header_map: Dict[str, int]) -> Optional[int]:
     return _find_col(header_map, ["GSpd(kmh)", "GSpd", "Speed(kmh)", "Speed"])
+
+
+def _find_lq_col(header_map: Dict[str, int]) -> Optional[int]:
+    # EdgeTX/ELRS link-quality columns. RQly is "received quality" (uplink LQ from
+    # the perspective of the radio); we prefer it over TQly when both are present.
+    return _find_col(header_map, [
+        "RQly(%)", "RQly", "TQly(%)", "TQly", "LQ(%)", "LQ", "LQly(%)", "LQly",
+    ])
 
 
 def _find_rssi_cols(header_map: Dict[str, int]) -> List[int]:
@@ -274,6 +283,7 @@ def repair_stale_gps(
                     alt_m=p.alt_m,
                     speed_kmh=p.speed_kmh,
                     rssi_db=p.rssi_db,
+                    lq=p.lq,
                 )
             )
         else:
@@ -308,7 +318,7 @@ def load_track(
     """
     points: List[TrackPoint] = []
 
-    with open(csv_path, "r", newline="", encoding="utf-8", errors="ignore") as f:
+    with open(csv_path, "r", newline="", encoding="utf-8-sig", errors="ignore") as f:
         reader = csv.reader(f)
         header = next(reader, None)
         if not header:
@@ -322,6 +332,7 @@ def load_track(
         alt_idx = _find_alt_col(header_map)
         spd_idx = _find_speed_col(header_map)
         rssi_cols = _find_rssi_cols(header_map)
+        lq_idx = _find_lq_col(header_map)
 
         if gps_idx is None:
             return []
@@ -354,6 +365,10 @@ def load_track(
 
             rssi_db = _combine_rssi(row, rssi_cols) if rssi_cols else None
 
+            lq = None
+            if lq_idx is not None and lq_idx < len(row):
+                lq = _parse_float(row[lq_idx])
+
             points.append(
                 TrackPoint(
                     t=t,
@@ -362,6 +377,7 @@ def load_track(
                     alt_m=alt_m,
                     speed_kmh=speed_kmh,
                     rssi_db=rssi_db,
+                    lq=lq,
                 )
             )
 
@@ -375,9 +391,13 @@ def load_track(
             min_anchor_dist_m=stale_min_anchor_dist_m,
         )
 
-    # Downsample if needed
+    # Downsample if needed. Always keep the final point — it's the last known
+    # position, which matters for crash recovery (see export_kml.py).
     if max_points > 0 and len(points) > max_points:
         step = max(1, len(points) // max_points)
+        last = points[-1]
         points = points[::step]
+        if points[-1] is not last:
+            points.append(last)
 
     return points

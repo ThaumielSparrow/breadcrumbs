@@ -5,8 +5,8 @@
   <title>Track Map</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
-  <!-- Leaflet + hotline via jsDelivr -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css"/>
+  <!-- Leaflet + hotline (bundled — see src/breadcrumbs/ui/vendor/) -->
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css"/>
 
   <style>
     html, body, #map { height: 100%; margin: 0; padding: 0; }
@@ -65,6 +65,23 @@
       display: none;
       max-width: 560px;
     }
+
+    /* Transient toast for tile fetch failures */
+    #tile-toast {
+      position: absolute;
+      left: 50%;
+      top: 12px;
+      transform: translateX(-50%);
+      z-index: 2000;
+      background: rgba(40,40,40,0.92);
+      color: #fff;
+      font-family: sans-serif;
+      font-size: 12px;
+      padding: 6px 12px;
+      border-radius: 6px;
+      pointer-events: none;
+      display: none;
+    }
   </style>
 </head>
 
@@ -72,6 +89,7 @@
 <div id="map"></div>
 
 <div id="msg"></div>
+<div id="tile-toast"></div>
 
 <div id="legend">
   <div id="legend-title"></div>
@@ -82,8 +100,8 @@
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/leaflet-hotline@0.4.0/dist/leaflet.hotline.min.js"></script>
+<script src="vendor/leaflet/leaflet.js"></script>
+<script src="vendor/leaflet-hotline/leaflet.hotline.min.js"></script>
 
 <script>
   var map = null;
@@ -93,6 +111,9 @@
   var fullLayer = null;
   var trailLayer = null;
   var headLayer = null;
+
+  // Signal-dropout overlays (red dashed polylines, drawn above the full path).
+  var dropoutLayers = [];
 
   // Markers
   var startMarker = null;
@@ -137,6 +158,24 @@
     el.style.display = "block";
   }
 
+  // Tile-error toast. Coalesces multiple errors into a single counter so a
+  // burst of offline tile fetches doesn't spam the UI.
+  var _tileErrorCount = 0;
+  var _tileErrorTimer = null;
+  function flashTileError() {
+    _tileErrorCount++;
+    var el = document.getElementById("tile-toast");
+    el.textContent = _tileErrorCount === 1
+      ? "Tile fetch failed (offline or server error)"
+      : "Tile fetch failed (" + _tileErrorCount + "×)";
+    el.style.display = "block";
+    if (_tileErrorTimer) clearTimeout(_tileErrorTimer);
+    _tileErrorTimer = setTimeout(function () {
+      el.style.display = "none";
+      _tileErrorCount = 0;
+    }, 3000);
+  }
+
   function ensureMap() {
     if (map) return true;
 
@@ -160,16 +199,18 @@
     var satUrl = "http://127.0.0.1:" + window.CACHE_PORT + "/esri/{z}/{x}/{y}.png";
 
     // 1. Normal OpenStreetMap
-    var osmLayer = L.tileLayer(osmUrl, { 
+    var osmLayer = L.tileLayer(osmUrl, {
       maxZoom: 19,
       attribution: 'Map data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
     });
+    osmLayer.on('tileerror', flashTileError);
 
     // 2. Esri Satellite Imagery
-    var satLayer = L.tileLayer(satUrl, { 
+    var satLayer = L.tileLayer(satUrl, {
       maxZoom: 19,
       attribution: 'Powered by <a href="https://www.esri.com/">Esri</a>'
     });
+    satLayer.on('tileerror', flashTileError);
 
     // 3. OpenTopoMap (Terrain)
     // var terLayer = L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", { 
@@ -579,6 +620,33 @@
     };
   };
 
+  window.clearDropouts = function() {
+    for (var i = 0; i < dropoutLayers.length; i++) {
+      removeLayerSafe(dropoutLayers[i]);
+    }
+    dropoutLayers = [];
+  };
+
+  window.plotDropouts = function(segments) {
+    window.clearDropouts();
+    if (!ensureMap()) return;
+    if (!Array.isArray(segments) || segments.length === 0) return;
+
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      if (!Array.isArray(seg) || seg.length < 2) continue;
+      var layer = L.polyline(seg, {
+        color: "#e53935",
+        weight: 4,
+        opacity: 0.95,
+        dashArray: "6, 6",
+        interactive: false,
+      });
+      layer.addTo(map);
+      dropoutLayers.push(layer);
+    }
+  };
+
   window.clearTrack = function() {
     playing = false;
     lastFrameMs = null;
@@ -593,6 +661,8 @@
     removeLayerSafe(startMarker); startMarker = null;
     removeLayerSafe(endMarker); endMarker = null;
     removeLayerSafe(droneMarker); droneMarker = null;
+
+    window.clearDropouts();
 
     fullData = null;
     fullMeta = null;

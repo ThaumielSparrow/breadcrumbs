@@ -1,6 +1,6 @@
-# src/core/export_kml.py
 from typing import List, Optional
-from .load import TrackPoint
+
+from breadcrumbs.core.load import TrackPoint
 
 def _escape_xml(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

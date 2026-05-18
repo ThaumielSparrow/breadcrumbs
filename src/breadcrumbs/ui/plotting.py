@@ -2,7 +2,48 @@
 
 import json
 import statistics
-from core.load import TrackPoint
+from typing import List
+from breadcrumbs.core.load import TrackPoint
+
+
+def _is_dropout(p: TrackPoint) -> bool:
+    """A sample is a 'dropout' when the link is gone or both quality channels
+    are missing — LQ explicitly zero, or LQ and RSSI both unknown."""
+    if p.lq is not None and p.lq <= 0:
+        return True
+    if p.lq is None and p.rssi_db is None:
+        return True
+    return False
+
+
+def build_dropout_segments(track: List[TrackPoint]) -> List[List[List[float]]]:
+    """Return contiguous runs of dropout samples as [[lat, lon], ...] segments.
+
+    Each segment includes the sample immediately *before* and *after* the run
+    so the rendered polyline connects to the live path on both ends. Single-
+    sample dropouts produce a 3-point segment (prev, dropout, next)."""
+    n = len(track)
+    if n < 2:
+        return []
+
+    segments: List[List[List[float]]] = []
+    i = 0
+    while i < n:
+        if _is_dropout(track[i]):
+            start = i
+            while i < n and _is_dropout(track[i]):
+                i += 1
+            end = i  # exclusive
+
+            seg_start = max(0, start - 1)
+            seg_end = min(n, end + 1)  # exclusive
+            seg = [[track[k].lat, track[k].lon] for k in range(seg_start, seg_end)]
+            if len(seg) >= 2:
+                segments.append(seg)
+        else:
+            i += 1
+
+    return segments
 
 
 def build_timeline_seconds(track: list[TrackPoint]) -> list[float]:

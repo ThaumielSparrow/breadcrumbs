@@ -7,6 +7,7 @@ class WorkerSignals(QObject):
     """Signals emitted by Worker threads."""
     done = Signal(object)
     error = Signal(str)
+    progress = Signal(int, int)  # (done, total) — opt-in: set kwargs['progress']=signals.progress.emit
 
 
 class Worker(QRunnable):
